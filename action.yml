@@ -1,0 +1,102 @@
+name: Zola to Cloudflare Pages
+description: Build a Zola site (with link checking) and deploy it to Cloudflare Pages.
+branding:
+  icon: upload-cloud
+  color: orange
+
+inputs:
+  api-token:
+    description: Cloudflare API token with "Cloudflare Pages - Edit". Required to deploy.
+    default: ""
+  account-id:
+    description: Cloudflare account ID. Only needed if the token has access to more than one account.
+    default: ""
+  project-name:
+    description: Cloudflare Pages project name. Defaults to the repository name.
+    default: ""
+  branch:
+    description: Cloudflare Pages branch to deploy to. Defaults to the repository default branch.
+    default: ""
+  deploy:
+    description: '"auto" deploys on pushes, schedules and manual runs on the default branch (never on pull requests). Use "true" or "false" to force.'
+    default: auto
+  zola-version:
+    description: Zola version to install (without the "v").
+    default: "0.21.0"
+  working-directory:
+    description: Directory containing config.toml.
+    default: "."
+  check-links:
+    description: Run `zola check --skip-external-links` before building.
+    default: "true"
+  pre-build-command:
+    description: Optional shell command run before the build (lint, tests, data validation). A non-zero exit fails the action.
+    default: ""
+
+outputs:
+  deployment-url:
+    description: URL of the Cloudflare Pages deployment (empty when nothing was deployed).
+    value: ${{ steps.cf.outputs.deployment-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan
+      id: plan
+      shell: bash
+      env:
+        DEPLOY: ${{ inputs.deploy }}
+        TOKEN: ${{ inputs.api-token }}
+        PROJECT: ${{ inputs.project-name || github.event.repository.name }}
+        BRANCH: ${{ inputs.branch || github.event.repository.default_branch }}
+        EVENT: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        if [ "$DEPLOY" = auto ]; then
+          if [ "$EVENT" != pull_request ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then DEPLOY=true; else DEPLOY=false; fi
+        fi
+        if [ "$DEPLOY" = true ]; then
+          [ -n "$TOKEN" ] || { echo "::error::api-token is required to deploy"; exit 1; }
+          [[ "$PROJECT" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::invalid project-name"; exit 1; }
+          [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid branch"; exit 1; }
+        fi
+        echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
+        echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+    - name: Pre-build command
+      if: inputs.pre-build-command != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CMD: ${{ inputs.pre-build-command }}
+      run: bash -eo pipefail -c "$CMD"
+
+    - name: Install Zola
+      shell: bash
+      env:
+        VERSION: ${{ inputs.zola-version }}
+      run: |
+        curl -fsSL "https://github.com/getzola/zola/releases/download/v${VERSION}/zola-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+          | sudo tar xz -C /usr/local/bin
+        zola --version
+
+    - name: Check and build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CHECK: ${{ inputs.check-links }}
+      run: |
+        [ "$CHECK" = "true" ] && zola check --skip-external-links
+        zola build
+
+    - name: Deploy to Cloudflare Pages
+      id: cf
+      if: steps.plan.outputs.deploy == 'true'
+      uses: cloudflare/wrangler-action@v3
+      with:
+        apiToken: ${{ inputs.api-token }}
+        accountId: ${{ inputs.account-id }}
+        workingDirectory: ${{ inputs.working-directory }}
+        command: pages deploy public --project-name=${{ steps.plan.outputs.project }} --branch=${{ steps.plan.outputs.branch }} --commit-hash=${{ github.sha }}
